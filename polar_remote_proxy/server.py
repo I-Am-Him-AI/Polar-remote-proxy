@@ -8,7 +8,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .auth import check_password
+from .auth import allowed_usernames, check_password, username_allowed
 from .capture import Capture
 from .input_relay import handle as relay_input
 from .wsutil import accept_key, encode_frame, read_frame
@@ -71,7 +71,14 @@ def _make_handler(server: RemoteServer):
                 self._websocket()
                 return
             if path == "/health":
-                self._json(200, {"ok": True, "service": "polar-remote-proxy"})
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "service": "polar-remote-proxy",
+                        "account_link": bool(allowed_usernames(server.record)),
+                    },
+                )
                 return
             self._json(401, {"ok": False, "error": "password_required"})
 
@@ -136,11 +143,17 @@ def _make_handler(server: RemoteServer):
             except (UnicodeDecodeError, json.JSONDecodeError):
                 msg = {}
             password = msg.get("password") if isinstance(msg, dict) else ""
+            username = msg.get("username") if isinstance(msg, dict) else None
             if not isinstance(password, str) or msg.get("type") != "auth" or not check_password(password, server.record):
                 _note_fail(ip)
                 time.sleep(0.4)
                 _send_text(sock, {"type": "auth", "ok": False, "state": "wrong_password"})
                 _send_close(sock, 4001)
+                return
+            if not username_allowed(username, server.record):
+                time.sleep(0.2)
+                _send_text(sock, {"type": "auth", "ok": False, "state": "account_required"})
+                _send_close(sock, 4003)
                 return
             _send_text(sock, {"type": "auth", "ok": True, "state": "waiting"})
             sock.settimeout(0.12)
