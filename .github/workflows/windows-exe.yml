@@ -1,0 +1,79 @@
+name: Windows exe
+
+on:
+  push:
+    branches:
+      - cursor/windows-exe-39ae
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pillow mss pynput
+
+      - name: Build windowed exe
+        run: |
+          python -m PyInstaller --noconsole --windowed --onefile --clean --name PolarRemoteProxy --collect-submodules polar_remote_proxy --collect-submodules pynput --collect-submodules mss --hidden-import PIL.Image --hidden-import PIL.ImageDraw desktop.py
+
+      - name: Confirm windowed PE executable
+        shell: pwsh
+        run: |
+          python -c "import pathlib; p=pathlib.Path('dist/PolarRemoteProxy.exe'); d=p.read_bytes(); assert d[:2]==b'MZ', 'not a Windows executable'; pe=int.from_bytes(d[0x3C:0x40],'little'); sub=int.from_bytes(d[pe+24+68:pe+24+70],'little'); print('subsystem', sub, 'bytes', len(d)); assert sub==2, 'expected WINDOWS_GUI subsystem (no console), got %s' % sub; assert len(d)>1000000"
+
+      - name: Smoke test the window
+        shell: pwsh
+        run: |
+          $env:POLAR_REMOTE_PASSWORD = "window-pass-1"
+          $env:POLAR_REMOTE_AUTH_FILE = Join-Path $env:TEMP "polar-remote-smoke-auth.json"
+          $env:POLAR_REMOTE_PORT = "8765"
+          if (Test-Path $env:POLAR_REMOTE_AUTH_FILE) { Remove-Item $env:POLAR_REMOTE_AUTH_FILE -Force }
+          $exe = (Resolve-Path dist\PolarRemoteProxy.exe).Path
+          $proc = Start-Process -FilePath $exe -PassThru
+          $ok = $false
+          $last = ""
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 3
+            if ($proc.HasExited) {
+              Write-Host "exe exited $($proc.ExitCode)"
+              break
+            }
+            try {
+              $res = Invoke-WebRequest -Uri http://127.0.0.1:8765/health -UseBasicParsing -TimeoutSec 3
+              $last = $res.Content
+              if ($res.Content -match "polar-remote-proxy") { $ok = $true; break }
+            } catch {
+              $last = $_.Exception.Message
+            }
+          }
+          if (-not $ok) {
+            Write-Host $last
+            $log = Join-Path $env:USERPROFILE ".polar-remote-proxy\app.log"
+            if (Test-Path $log) { Get-Content $log -Tail 100 }
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            throw "windowed exe did not serve /health"
+          }
+          Write-Host $last
+          python packaging\expect_frame.py
+          if ($LASTEXITCODE -ne 0) {
+            $log = Join-Path $env:USERPROFILE ".polar-remote-proxy\app.log"
+            if (Test-Path $log) { Get-Content $log -Tail 100 }
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            throw "windowed exe did not send a JPEG"
+          }
+          Stop-Process -Id $proc.Id -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PolarRemoteProxy
+          path: dist/PolarRemoteProxy.exe
+          if-no-files-found: error
