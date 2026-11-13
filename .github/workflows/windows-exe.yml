@@ -5,6 +5,7 @@ on:
     branches:
       - cursor/windows-exe-39ae
       - cursor/remote-stop-fix-b3cd
+      - cursor/remote-paused-on-stop-8dc2
   workflow_dispatch:
 
 jobs:
@@ -36,8 +37,10 @@ jobs:
         run: |
           $env:POLAR_REMOTE_PASSWORD = "window-pass-1"
           $env:POLAR_REMOTE_AUTH_FILE = Join-Path $env:TEMP "polar-remote-smoke-auth.json"
+          $env:POLAR_REMOTE_SHARE_FILE = Join-Path $env:TEMP "polar-remote-smoke-share.json"
           $env:POLAR_REMOTE_PORT = "8765"
           if (Test-Path $env:POLAR_REMOTE_AUTH_FILE) { Remove-Item $env:POLAR_REMOTE_AUTH_FILE -Force }
+          if (Test-Path $env:POLAR_REMOTE_SHARE_FILE) { Remove-Item $env:POLAR_REMOTE_SHARE_FILE -Force }
           $exe = (Resolve-Path dist\PolarRemoteProxy.exe).Path
           $proc = Start-Process -FilePath $exe -PassThru
           $ok = $false

@@ -13,9 +13,11 @@ from polar_remote_proxy.auth import (
     MIN_LEN,
     allowed_usernames,
     auth_path,
+    is_share_active,
     link_username,
     load_record,
     set_password,
+    set_share_active,
     unlink_username,
     valid_username,
 )
@@ -37,7 +39,7 @@ def save_password(password: str, confirm: str) -> None:
 
 
 def boot_remote() -> Boot:
-    """Same first-run rules as the console app, without reading the keyboard."""
+    """Password setup first; then listen only if sharing was left active."""
     path = auth_path()
     existed = path.is_file()
     env_pw = os.environ.get("POLAR_REMOTE_PASSWORD", "")
@@ -49,12 +51,16 @@ def boot_remote() -> Boot:
             user = os.environ.get("POLAR_REMOTE_LINK_USER", "").strip()
             if user:
                 link_username(user, path)
+            # Fresh env bootstrap (CI smoke): start sharing this launch.
+            set_share_active(True)
         except ValueError as exc:
             return Boot("setup", None, str(exc))
     record = load_record(path)
     if not record:
         return Boot("setup", None, f"No password is saved at {path}")
-    return Boot("listen", record, "")
+    if is_share_active():
+        return Boot("listen", record, "")
+    return Boot("stopped", record, "")
 
 
 def open_remote(record: dict):
@@ -105,7 +111,7 @@ def launch() -> None:
         try:
             import ctypes
 
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("IAmHim.PolarRemoteProxy.0.2")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("IAmHim.PolarRemoteProxy.0.2.2")
         except Exception:
             pass
 
@@ -146,6 +152,8 @@ def launch() -> None:
             if decision.mode == "listen" and decision.record:
                 self._status("Starting…")
                 self.after(100, lambda: self._listen(decision.record))
+            elif decision.mode == "stopped" and decision.record:
+                self._stopped(decision.record)
             else:
                 self._setup(decision.error)
 
@@ -229,6 +237,7 @@ def launch() -> None:
         def _running(self, server, info: dict) -> None:
             self.server = server
             self._starting = False
+            set_share_active(True)
             self.unbind("<Return>")
             self._clear()
             ttk.Label(self._body, text="Polar Remote Proxy is running.", font=("Segoe UI", 12, "bold")).pack(anchor="w")
@@ -259,14 +268,88 @@ def launch() -> None:
                     text="No Polar account is linked. The connection password is enough for this app.",
                     wraplength=460,
                 ).pack(anchor="w", pady=(0, 8))
-            ttk.Label(self._body, text="Leave this window open. Closing it stops the share.", wraplength=460).pack(anchor="w", pady=(0, 12))
+            ttk.Label(
+                self._body,
+                text="Leave this window open while sharing. Stop or closing the window ends the share and stays stopped until you Start again.",
+                wraplength=460,
+            ).pack(anchor="w", pady=(0, 12))
             row = ttk.Frame(self._body)
             row.pack(anchor="w")
             ttk.Button(row, text="Change password", command=self._change_password).pack(side="left", padx=(0, 8))
             ttk.Button(row, text="Link account", command=self._link).pack(side="left", padx=(0, 8))
             if linked:
                 ttk.Button(row, text="Unlink", command=self._unlink).pack(side="left", padx=(0, 8))
-            ttk.Button(row, text="Stop", command=self._close).pack(side="left")
+            ttk.Button(row, text="Stop", command=self._stop).pack(side="left")
+
+        def _stopped(self, record: dict) -> None:
+            self.server = None
+            self._starting = False
+            set_share_active(False)
+            self.unbind("<Return>")
+            self._clear()
+            ttk.Label(self._body, text="Stopped — not sharing.", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+            ttk.Label(
+                self._body,
+                text="This PC is not shared. Your password and account link are still saved. Click Start when you want Polar Remote Desktop to connect again.",
+                wraplength=460,
+            ).pack(anchor="w", pady=(6, 12))
+            linked = allowed_usernames(record)
+            if linked:
+                ttk.Label(
+                    self._body,
+                    text="Linked Polar accounts: " + ", ".join(linked),
+                    wraplength=460,
+                ).pack(anchor="w", pady=(0, 8))
+            else:
+                ttk.Label(
+                    self._body,
+                    text="No Polar account is linked. The connection password is enough for this app.",
+                    wraplength=460,
+                ).pack(anchor="w", pady=(0, 8))
+            row = ttk.Frame(self._body)
+            row.pack(anchor="w", pady=(4, 0))
+            ttk.Button(row, text="Start", command=lambda: self._resume(record)).pack(side="left", padx=(0, 8))
+            ttk.Button(row, text="Change password", command=self._change_password).pack(side="left", padx=(0, 8))
+            ttk.Button(row, text="Link account", command=self._link).pack(side="left", padx=(0, 8))
+            if linked:
+                ttk.Button(row, text="Unlink", command=self._unlink_stopped).pack(side="left")
+
+        def _resume(self, record: dict | None = None) -> None:
+            if self._starting:
+                return
+            fresh = record or load_record()
+            if not fresh:
+                self._setup(f"No password is saved at {auth_path()}")
+                return
+            self._listen(fresh)
+
+        def _end_share(self) -> None:
+            """Stop the listener and mark sharing paused. Keeps password settings."""
+            set_share_active(False)
+            server = self.server
+            self.server = None
+            if server is None:
+                return
+            try:
+                server.stop_share()
+            except Exception:
+                try:
+                    server.capture.stop()
+                except Exception:
+                    pass
+                try:
+                    server.shutdown()
+                except Exception:
+                    pass
+
+        def _stop(self) -> None:
+            """End the share and stay on a Stopped screen (durable until Start)."""
+            self._end_share()
+            record = load_record()
+            if not record:
+                self._setup(f"No password is saved at {auth_path()}")
+                return
+            self._stopped(record)
 
         def _change_password(self) -> None:
             value = _pair_dialog(self, "Change password", "New connection password", secret=True)
@@ -295,9 +378,13 @@ def launch() -> None:
                 _note(self, str(exc))
                 return
             fresh = load_record()
-            if fresh and self.server is not None:
+            if not fresh:
+                return
+            if self.server is not None:
                 self.server.record = fresh
                 self._running(self.server, describe_remote(self.server))
+            else:
+                self._stopped(fresh)
 
         def _unlink(self) -> None:
             if self.server is None:
@@ -315,21 +402,25 @@ def launch() -> None:
                 self.server.record = fresh
                 self._running(self.server, describe_remote(self.server))
 
+        def _unlink_stopped(self) -> None:
+            record = load_record()
+            if not record:
+                return
+            names = allowed_usernames(record)
+            if not names:
+                return
+            try:
+                unlink_username(names[-1])
+            except ValueError as exc:
+                _note(self, str(exc))
+                return
+            fresh = load_record()
+            if fresh:
+                self._stopped(fresh)
+
         def _close(self) -> None:
-            server = self.server
-            self.server = None
-            if server is not None:
-                try:
-                    server.stop_share()
-                except Exception:
-                    try:
-                        server.capture.stop()
-                    except Exception:
-                        pass
-                    try:
-                        server.shutdown()
-                    except Exception:
-                        pass
+            # Closing the window while sharing ends the share and stays stopped next launch.
+            self._end_share()
             try:
                 self.destroy()
             except Exception:

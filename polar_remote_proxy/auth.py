@@ -13,6 +13,7 @@ from pathlib import Path
 _USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
 
 AUTH_PATH = Path.home() / ".polar-remote-proxy" / "auth.json"
+SHARE_PATH = Path.home() / ".polar-remote-proxy" / "share.json"
 MIN_LEN = 4
 _N = 2**14
 
@@ -22,6 +23,39 @@ def auth_path() -> Path:
     if override:
         return Path(override)
     return AUTH_PATH
+
+
+def share_path() -> Path:
+    """Durable sharing flag. Lives next to auth.json; password settings stay untouched."""
+    override = os.environ.get("POLAR_REMOTE_SHARE_FILE", "").strip()
+    if override:
+        return Path(override)
+    auth = auth_path()
+    if auth != AUTH_PATH:
+        return auth.with_name("share.json")
+    return SHARE_PATH
+
+
+def is_share_active() -> bool:
+    """True only when the windowed app last left sharing on. Missing file = stopped."""
+    dest = share_path()
+    if not dest.is_file():
+        return False
+    try:
+        data = json.loads(dest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and data.get("active") is True
+
+
+def set_share_active(active: bool) -> None:
+    dest = share_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps({"active": bool(active)}), encoding="utf-8")
+    try:
+        os.chmod(dest, 0o600)
+    except OSError:
+        pass
 
 
 def _hash(password: str, salt: bytes) -> bytes:
