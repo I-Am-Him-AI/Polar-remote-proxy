@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - cursor/windows-exe-39ae
+      - cursor/remote-stop-fix-b3cd
   workflow_dispatch:
 
 jobs:

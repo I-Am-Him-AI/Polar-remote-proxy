@@ -40,7 +40,56 @@ class RemoteServer(ThreadingHTTPServer):
     def __init__(self, host: str, port: int, record: dict, capture: Capture | None = None) -> None:
         self.record = record
         self.capture = capture or Capture()
+        self._stopping = threading.Event()
+        self._clients_lock = threading.Lock()
+        self._clients: set[socket.socket] = set()
         super().__init__((host, port), _make_handler(self))
+
+    def register_client(self, sock: socket.socket) -> None:
+        with self._clients_lock:
+            self._clients.add(sock)
+
+    def unregister_client(self, sock: socket.socket) -> None:
+        with self._clients_lock:
+            self._clients.discard(sock)
+
+    def stop_share(self) -> None:
+        """End every viewer session, stop capture, and close the listener."""
+        if self._stopping.is_set():
+            return
+        self._stopping.set()
+        try:
+            self.capture.stop()
+        except Exception:
+            pass
+        with self._clients_lock:
+            clients = list(self._clients)
+            self._clients.clear()
+        for sock in clients:
+            try:
+                _send_close(sock, 1001)
+            except OSError:
+                pass
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            super().shutdown()
+        except Exception:
+            pass
+        try:
+            self.server_close()
+        except OSError:
+            pass
+
+    def shutdown(self) -> None:
+        """Same as stop_share so Ctrl+C / tests / Stop all end every viewer."""
+        self.stop_share()
 
 
 def make_server(host: str, port: int, record: dict, capture: Capture | None = None) -> RemoteServer:
@@ -99,6 +148,9 @@ def _make_handler(server: RemoteServer):
             self.wfile.write(body)
 
         def _websocket(self) -> None:
+            if server._stopping.is_set():
+                self._json(503, {"ok": False, "error": "stopped"})
+                return
             key = self.headers.get("Sec-WebSocket-Key")
             if not key:
                 self._json(400, {"ok": False, "error": "bad_handshake"})
@@ -112,11 +164,13 @@ def _make_handler(server: RemoteServer):
             self.close_connection = True
             sock = self.connection
             sock.settimeout(12)
+            server.register_client(sock)
             try:
                 self._session(sock)
             except (ConnectionError, socket.timeout, OSError, ValueError):
                 pass
             finally:
+                server.unregister_client(sock)
                 try:
                     sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
@@ -158,10 +212,12 @@ def _make_handler(server: RemoteServer):
             _send_text(sock, {"type": "auth", "ok": True, "state": "waiting"})
             sock.settimeout(0.12)
             last = b""
-            while True:
+            while not server._stopping.is_set():
                 try:
                     opcode, payload = read_frame(sock)
                 except socket.timeout:
+                    if server._stopping.is_set():
+                        return
                     frame, sw, sh = server.capture.snapshot()
                     if frame and frame != last:
                         sock.sendall(encode_frame(2, frame))
@@ -181,9 +237,15 @@ def _make_handler(server: RemoteServer):
                     incoming = json.loads(payload.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
-                if isinstance(incoming, dict):
-                    _w, sw, sh = server.capture.snapshot()
-                    relay_input(incoming, sw or 1280, sh or 720)
+                if not isinstance(incoming, dict):
+                    continue
+                kind = incoming.get("type")
+                if kind in ("disconnect", "stop", "close"):
+                    _send_text(sock, {"type": "stopped", "ok": True, "state": "idle"})
+                    _send_close(sock, 1000)
+                    return
+                _w, sw, sh = server.capture.snapshot()
+                relay_input(incoming, sw or 1280, sh or 720)
 
     return Handler
 

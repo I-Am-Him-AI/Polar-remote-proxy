@@ -318,21 +318,30 @@ def launch() -> None:
         def _close(self) -> None:
             server = self.server
             self.server = None
-
-            def stop() -> None:
-                if server is None:
-                    return
+            if server is not None:
                 try:
-                    server.capture.stop()
+                    server.stop_share()
                 except Exception:
-                    pass
-                try:
-                    server.shutdown()
-                except Exception:
-                    pass
+                    try:
+                        server.capture.stop()
+                    except Exception:
+                        pass
+                    try:
+                        server.shutdown()
+                    except Exception:
+                        pass
+            try:
+                self.destroy()
+            except Exception:
+                pass
+            # PyInstaller --onefile can leave viewer threads alive after Tk exits.
+            # Force the process down so the share really ends.
+            try:
+                import os as _os
 
-            threading.Thread(target=stop, daemon=True).start()
-            self.destroy()
+                _os._exit(0)
+            except Exception:
+                raise SystemExit(0)
 
     App().mainloop()
 

@@ -51,8 +51,7 @@ class DesktopBootTest(unittest.TestCase):
             self.assertEqual(health["service"], "polar-remote-proxy")
             self.assertNotIn(b"\xff\xd8", body)
         finally:
-            server.capture.stop()
-            server.shutdown()
+            server.stop_share()
 
     def test_mismatch_does_not_save(self) -> None:
         with self.assertRaises(ValueError):
