@@ -210,42 +210,86 @@ def _make_handler(server: RemoteServer):
                 _send_close(sock, 4003)
                 return
             _send_text(sock, {"type": "auth", "ok": True, "state": "waiting"})
-            sock.settimeout(0.12)
-            last = b""
-            while not server._stopping.is_set():
-                try:
-                    opcode, payload = read_frame(sock)
-                except socket.timeout:
-                    if server._stopping.is_set():
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            # Input is read here. Frames are pushed on their own thread so a
+            # stream of mouse moves cannot hold the latest picture back.
+            stop_send = threading.Event()
+            send_lock = threading.Lock()
+
+            def emit(data: bytes) -> None:
+                with send_lock:
+                    if stop_send.is_set():
+                        raise ConnectionError("stopped")
+                    sock.sendall(data)
+
+            def pump_frames() -> None:
+                last = b""
+                last_cursor = None
+                sent_jpeg = False
+                while not server._stopping.is_set() and not stop_send.is_set():
+                    frame, _sw, _sh, cursor = server.capture.snapshot()
+                    try:
+                        if frame and frame != last:
+                            emit(encode_frame(2, frame))
+                            last = frame
+                            sent_jpeg = True
+                        if sent_jpeg and cursor is not None and cursor != last_cursor:
+                            emit(
+                                encode_frame(
+                                    1,
+                                    json.dumps(
+                                        {"type": "cursor", "x": cursor[0], "y": cursor[1]}
+                                    ).encode("utf-8"),
+                                )
+                            )
+                            last_cursor = cursor
+                    except (ConnectionError, OSError):
                         return
-                    frame, sw, sh = server.capture.snapshot()
-                    if frame and frame != last:
-                        sock.sendall(encode_frame(2, frame))
-                        last = frame
-                    elif frame and last == b"":
-                        sock.sendall(encode_frame(2, frame))
-                        last = frame
-                    continue
-                if opcode == 8:
-                    return
-                if opcode == 9:
-                    sock.sendall(encode_frame(10, payload))
-                    continue
-                if opcode != 1:
-                    continue
-                try:
-                    incoming = json.loads(payload.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if not isinstance(incoming, dict):
-                    continue
-                kind = incoming.get("type")
-                if kind in ("disconnect", "stop", "close"):
-                    _send_text(sock, {"type": "stopped", "ok": True, "state": "idle"})
-                    _send_close(sock, 1000)
-                    return
-                _w, sw, sh = server.capture.snapshot()
-                relay_input(incoming, sw or 1280, sh or 720)
+                    if stop_send.wait(0.008):
+                        return
+
+            sender = threading.Thread(target=pump_frames, name="polar-remote-send", daemon=True)
+            sender.start()
+            sock.settimeout(0.5)
+            try:
+                while not server._stopping.is_set():
+                    try:
+                        opcode, payload = read_frame(sock)
+                    except socket.timeout:
+                        continue
+                    if opcode == 8:
+                        return
+                    if opcode == 9:
+                        try:
+                            emit(encode_frame(10, payload))
+                        except (ConnectionError, OSError):
+                            return
+                        continue
+                    if opcode != 1:
+                        continue
+                    try:
+                        incoming = json.loads(payload.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(incoming, dict):
+                        continue
+                    kind = incoming.get("type")
+                    if kind in ("disconnect", "stop", "close"):
+                        stop_send.set()
+                        with send_lock:
+                            sock.sendall(encode_frame(1, json.dumps({"type": "stopped", "ok": True, "state": "idle"}).encode("utf-8")))
+                            import struct
+
+                            sock.sendall(encode_frame(8, struct.pack("!H", 1000)))
+                        return
+                    sw, sh = server.capture.screen_size()
+                    relay_input(incoming, sw or 1280, sh or 720)
+            finally:
+                stop_send.set()
+                sender.join(timeout=1)
 
     return Handler
 
