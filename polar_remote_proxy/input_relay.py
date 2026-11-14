@@ -60,13 +60,15 @@ def _handle(msg: dict, screen_w: int, screen_h: int) -> None:
         x = int(_clamp(msg.get("x", 0)) * max(screen_w - 1, 1))
         y = int(_clamp(msg.get("y", 0)) * max(screen_h - 1, 1))
         _mouse.position = (x, y)
+        action = msg.get("action")
+        if action in (None, "", "move"):
+            return
         button = _button.left
         which = int(msg.get("button") or 0)
         if which == 1:
             button = _button.middle
         elif which == 2:
             button = _button.right
-        action = msg.get("action")
         if action == "down":
             _mouse.press(button)
         elif action == "up":

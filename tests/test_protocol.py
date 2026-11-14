@@ -6,6 +6,7 @@ import json
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -82,8 +83,7 @@ class ProtocolTest(unittest.TestCase):
         self.thread.start()
 
     def tearDown(self) -> None:
-        self.server.capture.stop()
-        self.server.shutdown()
+        self.server.stop_share()
         self.thread.join(timeout=3)
         self._tmp.cleanup()
 
@@ -205,6 +205,73 @@ class ProtocolTest(unittest.TestCase):
         self.assertTrue(health["account_link"])
         self.assertNotIn("darren", body)
         self.assertNotIn("username", body)
+
+    def test_disconnect_message_ends_session_without_more_frames(self) -> None:
+        sock = _connect(self.port)
+        read_frame(sock)
+        sock.sendall(encode_frame(1, json.dumps({"type": "auth", "password": "correct-horse"}).encode(), mask=True))
+        self.assertTrue(json.loads(read_frame(sock)[1])["ok"])
+        sock.settimeout(4)
+        self.assertEqual(read_frame(sock)[0], 2)
+        sock.sendall(encode_frame(1, json.dumps({"type": "disconnect"}).encode(), mask=True))
+        msg = None
+        for _ in range(16):
+            opcode, payload = read_frame(sock)
+            if opcode != 1:
+                continue
+            incoming = json.loads(payload)
+            if incoming.get("type") == "cursor":
+                continue
+            msg = incoming
+            break
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg["type"], "stopped")
+        self.assertEqual(msg["state"], "idle")
+        close_op, _close_payload = read_frame(sock)
+        self.assertEqual(close_op, 8)
+        sock.close()
+
+    def test_mouse_input_does_not_stall_frames(self) -> None:
+        sock = _connect(self.port)
+        read_frame(sock)
+        sock.sendall(encode_frame(1, json.dumps({"type": "auth", "password": "correct-horse"}).encode(), mask=True))
+        self.assertTrue(json.loads(read_frame(sock)[1])["ok"])
+        sock.settimeout(4)
+        self.assertEqual(read_frame(sock)[0], 2)
+        sock.settimeout(0.05)
+        extra = 0
+        deadline = time.time() + 1.2
+        move = json.dumps({"type": "mouse", "action": "move", "x": 0.4, "y": 0.4, "button": 0}).encode()
+        while time.time() < deadline:
+            sock.sendall(encode_frame(1, move, mask=True))
+            try:
+                opcode, payload = read_frame(sock)
+            except socket.timeout:
+                continue
+            if opcode == 2 and payload.startswith(b"\xff\xd8"):
+                extra += 1
+        self.assertGreaterEqual(extra, 2)
+        sock.close()
+
+    def test_stop_share_closes_live_session_and_listener(self) -> None:
+        sock = _connect(self.port)
+        read_frame(sock)
+        sock.sendall(encode_frame(1, json.dumps({"type": "auth", "password": "correct-horse"}).encode(), mask=True))
+        self.assertTrue(json.loads(read_frame(sock)[1])["ok"])
+        sock.settimeout(4)
+        self.assertEqual(read_frame(sock)[0], 2)
+        self.server.stop_share()
+        self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
+        dead = [th for th in threading.enumerate() if "process_request" in th.name]
+        self.assertEqual(dead, [])
+        sock.settimeout(1)
+        with self.assertRaises((ConnectionError, OSError, TimeoutError, socket.timeout)):
+            while True:
+                read_frame(sock)
+        with self.assertRaises((urllib.error.URLError, ConnectionError, OSError, TimeoutError)):
+            urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=1)
+        sock.close()
 
 
 if __name__ == "__main__":

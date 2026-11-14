@@ -123,8 +123,7 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
-        server.capture.stop()
-        server.shutdown()
+        server.stop_share()
 
 
 if __name__ == "__main__":
